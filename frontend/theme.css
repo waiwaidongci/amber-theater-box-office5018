@@ -1,0 +1,17 @@
+@import url('https://fonts.googleapis.com/css2?family=Rethink+Sans&family=Noto+Sans+SC:wght@400;500;600;700&display=swap');
+
+:root {
+  --ink: oklch(22% 0.044 18); --paper: oklch(94% 0.043 82); --accent: oklch(35% 0.135 19); --panel: oklch(97% 0.023 85);
+  --accent-ink: oklch(99% .01 85);
+  --accent-soft: color-mix(in oklch,var(--accent) 13%,var(--panel));
+  --muted: color-mix(in oklch,var(--ink) 76%,var(--paper));
+  --line: color-mix(in oklch,var(--ink) 24%,var(--paper));
+  --nav: color-mix(in oklch,var(--ink) 93%,var(--accent)); --nav-ink: var(--paper);
+  --display: 'Rethink Sans', 'PingFang SC', 'Songti SC', serif;
+  --body: 'Noto Sans SC', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+}
+.business-series {list-style:none;padding:0;display:grid;gap:.45rem;}
+.business-series li {display:grid;grid-template-columns:minmax(5rem,1fr) minmax(3rem,3fr) auto;gap:.7rem;align-items:center;}
+.bar-track {width:100%;height:.7rem;position:relative;background:var(--accent-soft);}
+.bar-track i {position:absolute;top:0;height:100%;background:var(--accent);}
+.hero {border-block-end:6px solid var(--accent)} .panel h2 {text-decoration:underline;text-underline-offset:.35em;text-decoration-color:var(--line)}

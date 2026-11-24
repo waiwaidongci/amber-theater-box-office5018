@@ -16,9 +16,14 @@ def analyze(rows, params):
             dict(zip((col['key'] for col in columns), row, strict=True)) for row in item['rows']
         ]})
     series = raw.get('series') or []
-    return {
+    result = {
         'headline': raw['summary'], 'note': ' '.join(raw.get('notes') or []),
         'metrics': raw['metrics'], 'tables': tables,
         'charts': [{'kind': 'bar', 'title': raw.get('series_title', '业务指标对比'), 'series': series}] if series else [],
         'ready': raw.get('ready', True),
+        'snapshot': raw.get('snapshot'),
+        'fingerprint': raw.get('fingerprint'),
     }
+    # 适配层重排表格后，以适配后的载荷为准重算指纹，页面结果与 CSV 底稿共用同一指纹。
+    result['fingerprint'] = analysis.result_fingerprint(result)
+    return result

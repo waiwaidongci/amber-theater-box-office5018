@@ -5,9 +5,10 @@ from src.config.database import Session
 from src.constants.enums import Status
 from src.domain.analysis import analyze
 from src.domain.spec import SPEC
-from src.models.jobs import Delivery, Run, Schedule
+from src.models.jobs import Delivery, ReportPublication, Run, Schedule
 from src.models.source import Dataset
 from src.services.audit import record
+from src.services.publication import idem_key, publish_run
 from src.utils.exports import write_report
 from src.utils.time import now
 
@@ -29,16 +30,31 @@ def materialize_due():
                 elapsed_days = (stamp - due).days
                 due += timedelta(days=elapsed_days)
                 period_key = SPEC.get('schedule_date_param')
+                next_params = dict(item.params)
                 if period_key:
                     report_day = date.fromisoformat(params[period_key]) + timedelta(days=elapsed_days)
                     params[period_key] = report_day.isoformat()
-                    item.params = {**params, period_key: (report_day + timedelta(days=1)).isoformat()}
+                    # 每日计划始终取最新快照批次，晚到退款补录后的新批次会被纳入。
                     dataset_id = db.scalar(select(Dataset.id).order_by(Dataset.id.desc()).limit(1)) or dataset_id
+                    # 仅在运行成功落库后才推进计划参数，避免失败重放时丢营业日。
+                    next_params[period_key] = (report_day + timedelta(days=1)).isoformat()
                 item.next_at = due + timedelta(days=1)
             else:
                 item.enabled = False
+            exists = db.scalar(select(Run.id).where(Run.schedule_id == item.id, Run.scheduled_at == due))
+            if exists:
+                record(db, 'worker', 'analysis.skipped_duplicate', exists, schedule_id=item.id)
+                continue
+            dataset = db.get(Dataset, dataset_id)
+            key = idem_key(params.get(SPEC.get('schedule_date_param', 'report_day')),
+                           dataset.checksum, params) if dataset else None
+            if key and db.scalar(select(Run.id).where(Run.idem_key == key)):
+                record(db, 'worker', 'analysis.skipped_duplicate', key, schedule_id=item.id)
+                continue
             db.add(Run(dataset_id=dataset_id, schedule_id=item.id, scheduled_at=due,
-                       name=item.name, params=params, author=item.author))
+                       name=item.name, params=params, author=item.author, idem_key=key))
+            if item.repeat_daily and period_key:
+                item.params = next_params
 
 
 def claim():
@@ -75,19 +91,41 @@ def execute(lease):
         failure = '计算失败，请检查字段口径后重试'
     with Session.begin() as db:
         job = db.get(Run, job_id, with_for_update=True)
+        # 租约易主（另一 worker 已接手）或状态已终结时，本次结果作废，不重复落库。
         if job.attempt != attempt or job.status != Status.RUNNING:
+            log.warning('Discard stale worker result for run %s attempt %s', job_id, attempt)
             return
         job.lease_until = None
         job.finished_at = now()
-        job.status = Status.FAILED if failure else Status.COMPLETE
-        job.result = None if failure else result
+        if failure:
+            job.status = Status.FAILED
+            job.result = None
+            job.error = failure
+            record(db, 'worker', 'analysis.failed', job.id, attempt=attempt, reason=failure)
+            return
+
+        job.status = Status.COMPLETE
+        job.result = result
         job.export_file = export
-        job.error = failure
-        record(db, 'worker', f'analysis.{job.status}', job.id, attempt=attempt, reason=failure)
+        job.error = None
+        publication, publish_error = publish_run(db, job, result, export)
+        record(db, 'worker', 'analysis.complete', job.id, attempt=attempt,
+               publication_id=publication.id if publication else None, reason=publish_error)
+        if publish_error:
+            # 底稿与桥接不一致时不切换版本：页面沿用旧版，本次运行标记失败并保留排查线索。
+            job.status = Status.FAILED
+            job.error = publish_error[:500]
+            record(db, 'worker', 'publication.rejected', job.id, reason=publish_error)
+            return
         if job.schedule_id:
             plan = db.get(Schedule, job.schedule_id)
-            ready = not failure and result.get('ready', True)
-            detail = '已保存 CSV 到站内收件箱' if ready else (failure or result['headline'])
-            receipt = Delivery(run_id=job.id, recipient=plan.recipient, state='delivered' if ready else 'blocked', detail=detail[:500])
-            db.add(receipt)
-            record(db, 'worker', f'delivery.{receipt.state}', job.id, recipient=plan.recipient)
+            ready = result.get('ready', True)
+            detail = '已保存 CSV 到站内收件箱' if ready else result['headline']
+            # 同运行只允许一个回执；重跑/恢复不重复生成，保留既有签收记录。
+            existing = db.scalar(select(Delivery).where(Delivery.run_id == job.id))
+            if existing is None:
+                receipt = Delivery(run_id=job.id, recipient=plan.recipient,
+                                   state='delivered' if ready else 'blocked', detail=detail[:500])
+                db.add(receipt)
+                db.flush()
+                record(db, 'worker', f'delivery.{receipt.state}', job.id, recipient=plan.recipient)

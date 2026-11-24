@@ -8,6 +8,15 @@ import {workspace} from '../stores/workspace.js';
 import {button, el, h, link, p} from '../utils/dom.js';
 import {date, value} from '../utils/format.js';
 
+function publicationBadge(job) {
+  const info = job.publication;
+  if (!info) return pill('未发布', 'unpublished');
+  if (info.state === 'superseded') {
+    return pill(`历史版本 v${info.version}（已被新版替代，留存对账）`, 'superseded');
+  }
+  return pill(`当前生效版本 v${info.version} · ${info.report_day}`, info.state);
+}
+
 export async function results(route, refresh) {
   const {spec,runs,datasets} = workspace;
   const id = route.id || runs[0]?.id;
@@ -18,7 +27,7 @@ export async function results(route, refresh) {
   const finished = item => item.status === 'complete' || item.status === 'failed';
   if (!finished(job)) {
     const original = location.hash;
-    const status = el('p',{role:'status'},'后台正在计算，完成后会自动展示。');
+    const status = el('p',{role:'status'},'后台正在计算，完成后会自动展示。重算未切换前，页面继续沿用当前生效旧版。');
     poll(()=>workspace.getRun(id),finished,()=>location.hash===original)
       .then(result=>{if (result && status.isConnected && location.hash===original) refresh();
         else if(status.isConnected) status.textContent='仍在执行，请点击刷新检查。';})
@@ -31,19 +40,30 @@ export async function results(route, refresh) {
     el('select',{id:'run-picker',onChange:event=>{location.hash=`#results/${event.target.value}`;}},
       (runs.some(item=>item.id===job.id) ? runs : [job,...runs]).map(item=>el('option',{value:item.id,selected:item.id===job.id},item.name))));
   const result = job.result;
-  const analysis = result ? el('section',{class:'analysis','data-testid':'analysis-complete'},
+  if (!result) {
+    return el('div',{},el('div',{class:'two-col'},
+      el('div',{class:'wide-panel'},panel(job.name,pill(STATUS[job.status],job.status),
+        p(job.error,'feedback'),link('返回调整参数',`#run/${job.dataset_id}`,{class:'quiet'}))),
+      el('aside',{class:'sidebar-panel'},panel('运行来源',history))));
+  }
+  const snapshotLine = result.snapshot
+    && p(`快照营业日 ${result.snapshot.report_day} · 纳入 ${result.snapshot.row_count} 行 · 指纹 ${result.snapshot.ledger_fingerprint.slice(0,12)}…`,'subtle');
+  const rejectLine = (job.status === 'failed' || !job.publication)
+    && p(job.error || '未通过桥接、渠道处置与 CSV 底稿一致性校验，页面继续沿用当前生效旧版。','feedback');
+  const analysis = el('section',{class:'analysis','data-testid':'analysis-complete'},
     el('div',{class:'result-head'},p(job.name,'eyeline'),h(2,result.headline),p(result.note,'intro-copy'),
-      el('div',{class:'actions'},pill(STATUS[job.status],job.status),download,message)),
+      el('div',{class:'actions'},publicationBadge(job),pill(STATUS[job.status],job.status),download,message)),
+    rejectLine,
+    snapshotLine,
     metrics(result.metrics),
     result.charts.map(plot),
     (result.sections || []).map(item=>panel(item.title,p(item.text))),
-    result.tables.map(item=>panel(item.title,table(item.columns,item.rows,{caption:item.title}))))
-    : panel(job.name,pill(STATUS[job.status],job.status),p(job.error,'feedback'),link('返回调整参数',`#run/${job.dataset_id}`,{class:'quiet'}));
+    result.tables.map(item=>panel(item.title,table(item.columns,item.rows,{caption:item.title}))));
   const inputs = spec.params.map(param=>el('div',{},el('dt',{},param.label),el('dd',{},value(job.params[param.key]))));
   return el('div',{},el('div',{class:'two-col'},el('div',{class:'wide-panel'},analysis),
     el('aside',{class:'sidebar-panel'},panel('运行来源',history,
       source && link(source.name,`#inputs/${source.id}`),p(date(job.finished_at),'subtle'),
       el('dl',{class:'dictionary'},inputs)),
-    result && panel(spec.decision, pill(REVIEW[job.review],job.review),
+    panel(spec.decision, pill(REVIEW[job.review],job.review),
       link('打开复核记录',`#review/${job.id}`,{class:'quiet'})))));
 }

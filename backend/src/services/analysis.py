@@ -2,13 +2,38 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import date
 from fractions import Fraction
+import hashlib
+import json
 
 
 MAX_TICKETS = 100_000
 MAX_PRICE = 1_000_000  # 分
 MAX_AMOUNT = MAX_TICKETS * MAX_PRICE
 BRIDGE_TERMS = ('票量贡献', '组合贡献', '价格贡献', '退款贡献')
+BRIDGE_LABELS = ('计划净票房', '实际净实收', *BRIDGE_TERMS, '舍入尾差', '净差异')
 DISPLAY_STEPS = {'元（保留分）': 1, '元（取整）': 100}
+
+
+def snapshot_fingerprint(rows, report_day):
+    """晚到退款补录后，新批次的行不同则指纹不同。只纳入该营业日的台账，
+    保证按原演出营业日归集的快照可被精确识别与对账。"""
+    scope = [row for row in rows if row.get('report_day') == report_day]
+    raw = json.dumps(scope, ensure_ascii=False, sort_keys=True,
+                     separators=(',', ':'), allow_nan=False)
+    return hashlib.sha256(raw.encode('utf-8')).hexdigest()
+
+
+def result_fingerprint(result):
+    """对桥接、渠道处置与复算底稿的关键载荷取指纹，供发布前一致性校验。"""
+    payload = {
+        'metrics': result.get('metrics'),
+        'tables': result.get('tables'),
+        'series': result.get('series'),
+        'snapshot': result.get('snapshot'),
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                     separators=(',', ':'), allow_nan=False, default=str)
+    return hashlib.sha256(raw.encode('utf-8')).hexdigest()
 
 
 def _integer(value, label, minimum, maximum):
@@ -236,7 +261,6 @@ def analyze(rows, params):
         f'相差 {total.gap / 100:+,.2f} 元。'
         + (f'建议{"、".join(attention)}。' if attention else '各渠道维持当前配额和投放，随次日报复核。')
     )
-    bridge_labels = ('计划净票房', '实际净实收', *BRIDGE_TERMS, '舍入尾差', '净差异')
     explanations = (
         '计划票量乘计划单价，再减计划退款', '退款前实收减实退',
         '保持全剧场计划组合份额和基准单价，替换总票量',
@@ -246,8 +270,11 @@ def analyze(rows, params):
     )
     unit_label = '金额（元，取整）' if step == 100 else '金额（元，保留至分）'
     bridge_rows = [[name, money(value), detail] for name, value, detail in
-                   zip(bridge_labels, total_display, explanations, strict=True)]
-    return {
+                   zip(BRIDGE_LABELS, total_display, explanations, strict=True)]
+    ledger_rows = [[line.performance, line.channel, line.tier, line.plan_tickets, line.plan_price,
+                    line.plan_refund, line.actual_tickets, line.actual_gross, line.actual_refund]
+                   for line in selected]
+    result = {
         'summary': summary,
         'metrics': [
             {'label': '计划票量', 'value': plan_total, 'detail': '张，含计划赠票'},
@@ -259,15 +286,14 @@ def analyze(rows, params):
         ],
         'tables': [
             {'title': '全剧场计划到实收桥接', 'columns': ['项目', unit_label, '计算口径'], 'rows': bridge_rows},
-            {'title': f'渠道贡献与跨渠道舍入对账 · {precision}', 'columns': ['渠道', *bridge_labels],
+            {'title': f'渠道贡献与跨渠道舍入对账 · {precision}', 'columns': ['渠道', *BRIDGE_LABELS],
              'rows': channel_rows},
             {'title': '渠道处置建议', 'columns': ['渠道', '精确净差异（元）', '退款率（%，显示两位）', '处置', '下一步'],
              'rows': decisions},
             {'title': f'复算底稿 · {day}',
              'columns': ['场次', '渠道', '票档', '计划票量（张）', '计划单价（分）', '计划退款（分）',
                          '出票量（张）', '退款前实收（分）', '实退（分）'],
-             'rows': [[line.performance, line.channel, line.tier, line.plan_tickets, line.plan_price,
-                       line.plan_refund, line.actual_tickets, line.actual_gross, line.actual_refund] for line in selected]},
+             'rows': ledger_rows},
         ],
         'notes': [
             f'营业日 {day}，纳入 {len(selected)} 行。退款以原演出场次、渠道和票档归集，底稿金额以分计。',
@@ -278,5 +304,12 @@ def analyze(rows, params):
         ],
         'series_title': f'净实收差异分解 · {precision}',
         'series': [{'label': label, 'value': money(value)}
-                   for label, value in zip(bridge_labels[2:-1], total_display[2:-1], strict=True)],
+                   for label, value in zip(BRIDGE_LABELS[2:-1], total_display[2:-1], strict=True)],
+        'snapshot': {
+            'report_day': day,
+            'row_count': len(selected),
+            'ledger_fingerprint': snapshot_fingerprint(rows, day),
+        },
     }
+    result['fingerprint'] = result_fingerprint(result)
+    return result
